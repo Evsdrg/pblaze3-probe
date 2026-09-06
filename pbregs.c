@@ -582,6 +582,20 @@ static int cmd_info(void)
 	return 0;
 }
 
+/*
+ * Single 32-bit MMIO read, nothing else. Used to test whether the card
+ * survives plain memory reads toward its BAR.
+ */
+static void cmd_peek(int argc, char **argv)
+{
+	unsigned int off = PB_REG_VERSION;
+
+	if (argc > optind)
+		off = (unsigned int)strtoul(argv[optind], NULL, 16);
+
+	printf("peek @0x%03x = 0x%08" PRIx32 "\n", off, rd(off));
+}
+
 static void cmd_flowctl(void)
 {
 	printf("applying vendor flow-control init sequence...\n");
@@ -656,6 +670,8 @@ int main(int argc, char **argv)
 		return cmd_info();
 	else if (!strcmp(cmd, "flowctl"))
 		cmd_flowctl();
+	else if (!strcmp(cmd, "peek"))
+		cmd_peek(argc, argv);
 	else
 		usage(argv[0]), exit(1);
 
