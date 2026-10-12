@@ -43,8 +43,11 @@ make                                                   # 内核模块
 # 设备无驱动绑定，需先启用内存解码（内核不会自动做）
 sudo setpci -s 0000:01:00.0 COMMAND=0002:0002
 
-# nvidia-smi 风格汇总：身份 / 传感器 / 链路 / 健康
+# nvidia-smi 风格结构化汇总（中文，带边框表格）
 sudo ./pbregs status
+
+# 脚本友好：key=value 纯文本
+sudo ./pbregs -p status
 
 # 单项查询
 sudo ./pbregs peek 0     # 单次只读寄存器（预检失败即停止）
@@ -52,7 +55,14 @@ sudo ./pbregs report     # 寄存器明细 + XADC（含通道选择写）
 sudo ./pbregs rom        # CMD_READROM 完整键值
 sudo ./pbregs mon        # CMD_READMON 原始健康块
 sudo ./pbregs msg        # 固件调试消息缓冲区
+
+# 离线回归测试（无需硬件/root）
+python3 tests/regress_pbregs.py
 ```
+
+`status` 输出分三张表：**设备信息**（型号/序列号/固件/总线/链路/容量/规格）、
+**传感器**（核心温度、各路电压、板温）、**健康指标**（坏块、坏 die、计数、
+容量、写放大、寿命）。固件未达 RUN 时健康项显示"不可用"并注明原因。
 
 `pbregs` 可用 `-t 毫秒` 调整邮箱超时（默认 200ms；官方驱动是 5 分钟死等）。
 原工具保留 `info`、`flowctl`、`dump` 实验命令。内核模块加载与主动

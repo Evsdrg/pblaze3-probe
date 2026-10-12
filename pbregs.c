@@ -594,168 +594,421 @@ static void print_size(const char *name, unsigned long long bytes)
 }
 
 /*
- * nvidia-smi style summary. Groups A (ROM identity), B (sensors) and
- * C (link/status) are always printed. Group D (health/performance) is
- * printed only when the firmware has reached RUN; otherwise it is
- * reported as unavailable rather than as zeroes.
+ * Structured output helpers. CJK characters occupy two terminal
+ * columns, so cell padding is computed from display width rather than
+ * byte length; otherwise the box borders would not line up.
  */
-static int cmd_status(const char *path)
+static bool utf8_is_wide(unsigned int cp)
+{
+	return (cp >= 0x1100 && cp <= 0x115f) ||
+	       (cp >= 0x2e80 && cp <= 0x303e) ||
+	       (cp >= 0x3041 && cp <= 0x33ff) ||
+	       (cp >= 0x3400 && cp <= 0x4dbf) ||
+	       (cp >= 0x4e00 && cp <= 0x9fff) ||
+	       (cp >= 0xa000 && cp <= 0xa4cf) ||
+	       (cp >= 0xac00 && cp <= 0xd7a3) ||
+	       (cp >= 0xf900 && cp <= 0xfaff) ||
+	       (cp >= 0xfe30 && cp <= 0xfe4f) ||
+	       (cp >= 0xff00 && cp <= 0xff60) ||
+	       (cp >= 0xffe0 && cp <= 0xffe6) ||
+	       (cp >= 0x20000 && cp <= 0x3fffd);
+}
+
+static int utf8_width(const char *s)
+{
+	int w = 0;
+
+	while (*s) {
+		unsigned char c = (unsigned char)*s;
+		unsigned int cp;
+		int len, i;
+
+		if (c < 0x80) {
+			cp = c;
+			len = 1;
+		} else if ((c & 0xe0) == 0xc0) {
+			cp = c & 0x1f;
+			len = 2;
+		} else if ((c & 0xf0) == 0xe0) {
+			cp = c & 0x0f;
+			len = 3;
+		} else if ((c & 0xf8) == 0xf0) {
+			cp = c & 0x07;
+			len = 4;
+		} else {
+			s++;
+			w++;
+			continue;
+		}
+
+		for (i = 1; i < len && s[i]; i++)
+			cp = (cp << 6) | (s[i] & 0x3f);
+
+		w += utf8_is_wide(cp) ? 2 : 1;
+		s += len;
+	}
+
+	return w;
+}
+
+static void tbl_cell(const char *s, int width)
+{
+	int pad = width - utf8_width(s);
+
+	printf("| %s", s);
+	while (pad-- > 0)
+		putchar(' ');
+	putchar(' ');
+}
+static void tbl_sep(const int *w, int n, char fill)
+{
+	int i, j;
+
+	putchar('+');
+	for (i = 0; i < n; i++) {
+		for (j = 0; j < w[i] + 2; j++)
+			putchar(fill);
+		putchar('+');
+	}
+	putchar('\n');
+}
+
+static void tbl_row(const int *w, const char *const *cells, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		tbl_cell(cells[i], w[i]);
+	printf("|\n");
+}
+
+static void tbl_banner(int inner, const char *left, const char *right)
+{
+	int pad = inner - utf8_width(left) - utf8_width(right);
+
+	printf("| %s", left);
+	while (pad-- > 0)
+		putchar(' ');
+	printf("%s |\n", right);
+}
+
+/* Extract the BDF component from a sysfs resource path. */
+static void pb_bdf_from_path(const char *resource, char *out, size_t outlen)
+{
+	char tmp[PATH_MAX];
+	char *p;
+
+	snprintf(tmp, sizeof(tmp), "%s", resource);
+	p = strrchr(tmp, '/');
+	if (p)
+		*p = '\0';
+	p = strrchr(tmp, '/');
+	snprintf(out, outlen, "%s", p ? p + 1 : "?");
+}
+
+/* Max capacity from ROM geometry, mirroring the vendor tool. */
+static unsigned long long rom_max_capacity(const char *rom, unsigned int tetris)
+{
+	unsigned long long bytes_in_block;
+
+	bytes_in_block = (unsigned long long)rom_int(rom, "FlashSectorSize:") *
+			 rom_int(rom, "FlashPlaneSize:") *
+			 rom_int(rom, "FlashPageSize:") *
+			 rom_int(rom, "FlashBlockSize:");
+
+	return (unsigned long long)rom_int(rom, "MaxAddressedBlockSizeInTetris:") *
+	       7 * bytes_in_block * tetris;
+}
+
+static void print_size_cell(char *out, size_t outlen, unsigned long long bytes)
+{
+	static const char *const unit[] = { "B", "KB", "MB", "GB", "TB" };
+	double val = (double)bytes;
+	int i = 0;
+
+	while (val >= 1024.0 && i < (int)ARRAY_SIZE(unit) - 1) {
+		val /= 1024.0;
+		i++;
+	}
+	snprintf(out, outlen, "%.2f %s", val, unit[i]);
+}
+
+/*
+ * nvidia-smi style summary, localized to Chinese. Layout: a bordered
+ * banner with timestamp and versions, a device row, then sensor and
+ * health tables. Health/performance fields that depend on the FTL are
+ * reported as unavailable when the firmware has not reached RUN,
+ * rather than as fabricated zeroes.
+ */
+static int cmd_status(const char *path, bool plain)
 {
 	static uint16_t rombuf[PB_ROM_SIZE / sizeof(uint16_t)];
 	static uint16_t monbuf[sizeof(struct pb_monitor) / sizeof(uint16_t)];
 	const char *rom = (const char *)rombuf;
-	struct pb_monitor m;
+	struct pb_monitor m = { 0 };
 	uint16_t status;
 	uint32_t mb0, mb1, stage;
+	const char *model = "?", *sn = "?", *fwver = "?";
+	const char *flashcell = "?", *flashtype = "?", *motherpn = "?";
+	const char *formfactor = "未知";
+	char ts[32], fwsize[32] = "?", busid[32] = "?";
+	char dev0[80], dev1[80], dev2[80], link[32], stg[32], health[32];
+	char capacity[32] = "不可用";
+	const char *stg_cn;
 	int width = 0, gen = 0;
-	bool rom_ok = false;
-	bool mon_ok = false;
+	bool rom_ok = false, mon_ok = false, link_ok;
+	int w3[3] = { 30, 24, 20 };
+	const int inner = 30 + 24 + 20 + 6;
+	time_t now;
+	struct tm *tm;
 
+	/* ---- gather ---- */
 	mb0 = rd(PB_REG_READ_MB0);
 	mb1 = rd(PB_REG_READ_MB1);
 	stage = (mb1 >> PB_ST_STAGE_SHIFT) & 3u;
-	if (stage == PB_STAGE_INIT && ((mb0 >> PB_ST_STAGE_SHIFT) & 3u) != PB_STAGE_INIT)
+	if (stage == PB_STAGE_INIT &&
+	    ((mb0 >> PB_ST_STAGE_SHIFT) & 3u) != PB_STAGE_INIT)
 		stage = (mb0 >> PB_ST_STAGE_SHIFT) & 3u;
 
-	/* Group A: identity from ROM (MB1 answers on this card) */
 	memset(rombuf, 0, sizeof(rombuf));
 	if (mb_comm(1, PB_CMD_READROM, PB_ROM_SIZE, rombuf, &status) == 0 &&
-	    status == PB_CMD_ECHO_SUCCEED)
+	    status == PB_CMD_ECHO_SUCCEED) {
 		rom_ok = true;
-	else {
+	} else {
 		memset(rombuf, 0, sizeof(rombuf));
 		if (mb_comm(0, PB_CMD_READROM, PB_ROM_SIZE, rombuf, &status) == 0 &&
 		    status == PB_CMD_ECHO_SUCCEED)
 			rom_ok = true;
 	}
 
-	printf("===== identity =====\n");
 	if (rom_ok) {
-		const char *model = rom_str(rom, "Model:");
-
-		printf("Model=%s\n", model ? model : "?");
-		printf("SerialNumber=%s\n",
-		       rom_str(rom, "Serial Number:") ?: "?");
-		printf("FirmwareVersion=%s\n",
-		       rom_str(rom, "Firmware Version:") ?: "?");
-		print_size("FirmwareSize",
-			   (unsigned long long)rom_int(rom, "Firmware Size:"));
-		printf("FlashCell=%s\n", rom_str(rom, "Flash Cell:") ?: "?");
-		printf("FlashType=%s\n", rom_str(rom, "Flash Type:") ?: "?");
-		printf("MotherCardPN=%s\n",
-		       rom_str(rom, "Mother Card PN:") ?: "?");
-		if (model && strlen(model) > 3) {
+		model = rom_str(rom, "Model:") ?: "?";
+		sn = rom_str(rom, "Serial Number:") ?: "?";
+		fwver = rom_str(rom, "Firmware Version:") ?: "?";
+		flashcell = rom_str(rom, "Flash Cell:") ?: "?";
+		flashtype = rom_str(rom, "Flash Type:") ?: "?";
+		motherpn = rom_str(rom, "Mother Card PN:") ?: "?";
+		snprintf(fwsize, sizeof(fwsize), "%.2f MB",
+			 (double)rom_int(rom, "Firmware Size:") / 1048576.0);
+		if (strlen(model) > 3) {
 			if (model[3] == 'H')
-				printf("FormFactor=Half-length,full-height\n");
+				formfactor = "半长全高";
 			else if (model[3] == 'L')
-				printf("FormFactor=Half-length,half-height\n");
+				formfactor = "半长半高";
 		}
-	} else {
-		printf("Model=unavailable (ROM read failed)\n");
-	}
-	printf("DeviceIndex=%lld\n", rom_int(rom, "DeviceIndex:"));
-
-	/* Group B: sensors (XADC + PCB) */
-	printf("===== sensors =====\n");
-	{
-		static const struct {
-			uint8_t ch;
-			const char *name;
-			bool is_temp;
-		} tbl[] = {
-			{ PB_XADC_TEMP,		"CoreTemperature",	true },
-			{ PB_XADC_MAX_TEMP,	"MaxCoreTemperature",	true },
-			{ PB_XADC_MIN_TEMP,	"MinCoreTemperature",	true },
-			{ PB_XADC_VCCINT,	"VCore",		false },
-			{ PB_XADC_VCCAUX,	"VPeripheral",		false },
-			{ PB_XADC_VDDR3,	"VDDR",			false },
-			{ PB_XADC_VFLASH_IO,	"VFlash",		false },
-			{ PB_XADC_VFLASH_CORE,	"VFlashCore",		false },
-		};
-		size_t i;
-
-		for (i = 0; i < ARRAY_SIZE(tbl); i++) {
-			uint16_t raw;
-
-			if (xadc_read(tbl[i].ch, &raw)) {
-				printf("%s=unavailable\n", tbl[i].name);
-				continue;
-			}
-			if (tbl[i].is_temp)
-				printf("%s=%.1fC\n", tbl[i].name,
-				       xadc_to_temp(raw));
-			else
-				printf("%s=%.2fV\n", tbl[i].name,
-				       xadc_to_volt(raw));
-		}
-		printf("BoardTemperature=%.1fC\n",
-		       pcb_to_temp((uint16_t)rd(PB_REG_PCB_TEMPERATURE)));
 	}
 
-	/* Group C: link and status */
-	printf("===== status =====\n");
-	if (pb_link_status(path, &width, &gen) == 0)
-		printf("PCIeLink=%d(v%d)\n", width, gen);
-	else
-		printf("PCIeLink=unavailable\n");
-	printf("FirmwareStage=%s\n", stage_name(stage));
-	printf("Status=%s\n", stage == PB_STAGE_RUN ? "Online" : "Offline");
+	link_ok = pb_link_status(path, &width, &gen) == 0;
 
-	/* Group D: health/performance, only meaningful once running */
-	printf("===== health =====\n");
 	memset(monbuf, 0, sizeof(monbuf));
 	if (mb_comm(1, PB_CMD_READMON, sizeof(monbuf), monbuf, &status) == 0 &&
-	    status == PB_CMD_ECHO_SUCCEED)
+	    status == PB_CMD_ECHO_SUCCEED) {
 		mon_ok = true;
-	else {
+	} else {
 		memset(monbuf, 0, sizeof(monbuf));
 		if (mb_comm(0, PB_CMD_READMON, sizeof(monbuf), monbuf, &status) == 0 &&
 		    status == PB_CMD_ECHO_SUCCEED)
 			mon_ok = true;
 	}
 
-	if (!mon_ok) {
-		printf("DeviceHealth=unavailable (READMON failed)\n");
-		return 1;
+	if (mon_ok) {
+		m.logical_read = u64_from_words64(monbuf + 0);
+		m.flash_read = u64_from_words64(monbuf + 4);
+		m.logical_write = u64_from_words64(monbuf + 8);
+		m.flash_write = u64_from_words64(monbuf + 12);
+		m.dead_block = (uint32_t)u64_from_words(monbuf + 18);
+		m.dead_die = monbuf[20];
+		m.init_count = monbuf[21];
+		m.start_count = monbuf[22];
+		m.over_heating = monbuf[23];
+		m.tetris_size_in_system = monbuf[24];
 	}
 
-	m.logical_read = u64_from_words64(monbuf + 0);
-	m.flash_read = u64_from_words64(monbuf + 4);
-	m.logical_write = u64_from_words64(monbuf + 8);
-	m.flash_write = u64_from_words64(monbuf + 12);
-	m.dead_block = (uint32_t)u64_from_words(monbuf + 18);
-	m.dead_die = monbuf[20];
-	m.init_count = monbuf[21];
-	m.start_count = monbuf[22];
-	m.over_heating = monbuf[23];
-	m.tetris_size_in_system = monbuf[24];
-
-	if (stage != PB_STAGE_RUN) {
-		printf("DeviceHealth=unavailable (firmware stage %s, "
-		       "not RUN)\n", stage_name(stage));
-		printf("DeviceDeadBlocks=%u\n", m.dead_block);
-		printf("DeviceDeadDies=%u\n", m.dead_die);
-		printf("InitializationCounts=%u\n", m.init_count);
-		printf("StartupCounts=%u\n", m.start_count);
-		printf("DeviceRemainLife=unavailable\n");
-		printf("AlreadyReadCapacity=unavailable\n");
-		printf("AlreadyWriteCapacity=unavailable\n");
-		printf("WriteAmplification=unavailable\n");
+	/* ---- plain key=value form for scripts ---- */
+	if (plain) {
+		printf("Model=%s\n", model);
+		printf("SerialNumber=%s\n", sn);
+		printf("FirmwareVersion=%s\n", fwver);
+		printf("FirmwareSize=%s\n", fwsize);
+		printf("FlashCell=%s\n", flashcell);
+		printf("FlashType=%s\n", flashtype);
+		printf("MotherCardPN=%s\n", motherpn);
+		if (link_ok)
+			printf("PCIeLink=%d(v%d)\n", width, gen);
+		else
+			printf("PCIeLink=unavailable\n");
+		printf("FirmwareStage=%s\n", stage_name(stage));
+		printf("Status=%s\n",
+		       stage == PB_STAGE_RUN ? "Online" : "Offline");
+		if (mon_ok) {
+			printf("DeviceDeadBlocks=%u\n", m.dead_block);
+			printf("DeviceDeadDies=%u\n", m.dead_die);
+			printf("InitializationCounts=%u\n", m.init_count);
+			printf("StartupCounts=%u\n", m.start_count);
+		}
+		if (mon_ok && stage == PB_STAGE_RUN) {
+			print_size("AlreadyReadCapacity", m.logical_read * 4096ull);
+			print_size("AlreadyWriteCapacity", m.logical_write * 4096ull);
+			printf("WriteAmplification=%.2f\n",
+			       m.logical_write ?
+			       (double)m.flash_write / m.logical_write : 0.0);
+		} else {
+			printf("DeviceHealth=unavailable\n");
+		}
 		return 0;
 	}
 
-	print_size("AlreadyReadCapacity", m.logical_read * 4096ull);
-	print_size("AlreadyWriteCapacity", m.logical_write * 4096ull);
-	printf("WriteAmplification=%.2f\n",
-	       m.logical_write ? (double)m.flash_write / m.logical_write : 0.0);
-	printf("DeviceDeadBlocks=%u\n", m.dead_block);
-	printf("DeviceDeadDies=%u\n", m.dead_die);
-	printf("InitializationCounts=%u\n", m.init_count);
-	printf("StartupCounts=%u\n", m.start_count);
-	printf("ReadOnly=%s\n", m.dead_die ? "Yes" : "No");
+	/* ---- structured, localized output ---- */
+	now = time(NULL);
+	tm = localtime(&now);
+	if (tm)
+		strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+	else
+		snprintf(ts, sizeof(ts), "unknown");
 
-	return 0;
+	pb_bdf_from_path(path, busid, sizeof(busid));
+
+	snprintf(dev0, sizeof(dev0), "  0  %s", model);
+	snprintf(dev1, sizeof(dev1), "     %s", sn);
+	/* keep only the version token; the full string has a build date */
+	{
+		char shortver[64];
+		const char *sp = strchr(fwver, ' ');
+
+		if (sp && (size_t)(sp - fwver) < sizeof(shortver)) {
+			memcpy(shortver, fwver, (size_t)(sp - fwver));
+			shortver[sp - fwver] = '\0';
+		} else {
+			snprintf(shortver, sizeof(shortver), "%s", fwver);
+		}
+		snprintf(dev2, sizeof(dev2), "     %s", shortver);
+	}
+	if (link_ok)
+		snprintf(link, sizeof(link), "x%d Gen%d", width, gen);
+	else
+		snprintf(link, sizeof(link), "不可用");
+
+	stg_cn = stage == PB_STAGE_RUN ? "运行 (RUN)" :
+		 stage == PB_STAGE_READY ? "就绪 (READY)" :
+		 stage == PB_STAGE_INIT ? "初始化 (INIT)" : "保留";
+	snprintf(stg, sizeof(stg), "%s", stg_cn);
+	snprintf(health, sizeof(health), "%s",
+		 stage == PB_STAGE_RUN ? "在线" : "离线");
+	if (mon_ok && stage == PB_STAGE_RUN)
+		print_size_cell(capacity, sizeof(capacity),
+				rom_max_capacity(rom, m.tetris_size_in_system));
+
+	printf("\n");
+	tbl_sep(w3, 3, '-');
+	tbl_banner(inner, "Memblaze PBlaze3 状态监控", ts);
+	tbl_banner(inner, "固件版本: " , "工具: pbregs");
+	tbl_sep(w3, 3, '-');
+	tbl_row(w3, (const char *[]){ "设备  型号", "总线地址", "链路状态" }, 3);
+	tbl_row(w3, (const char *[]){ "      序列号", "固件阶段", "健康状态" }, 3);
+	tbl_row(w3, (const char *[]){ "      固件版本", "容量", "规格" }, 3);
+	tbl_sep(w3, 3, '=');
+	tbl_row(w3, (const char *[]){ dev0, busid, link }, 3);
+	tbl_row(w3, (const char *[]){ dev1, stg, health }, 3);
+	tbl_row(w3, (const char *[]){ dev2, capacity, formfactor }, 3);
+	tbl_sep(w3, 3, '-');
+
+	printf("\n");
+	tbl_sep(w3, 3, '-');
+	tbl_row(w3, (const char *[]){ "传感器", "数值", "说明" }, 3);
+	tbl_sep(w3, 3, '=');
+	{
+		static const struct {
+			uint8_t ch;
+			const char *name;
+			bool is_temp;
+		} tbl[] = {
+			{ PB_XADC_TEMP,		"核心温度",		true },
+			{ PB_XADC_MAX_TEMP,	"核心温度 (最高)",	true },
+			{ PB_XADC_MIN_TEMP,	"核心温度 (最低)",	true },
+			{ PB_XADC_VCCINT,	"核心电压 VCCINT",	false },
+			{ PB_XADC_VCCAUX,	"辅助电压 VCCAUX",	false },
+			{ PB_XADC_VDDR3,	"DDR 电压 VDDR3",	false },
+			{ PB_XADC_VFLASH_IO,	"Flash IO 电压",	false },
+			{ PB_XADC_VFLASH_CORE,	"Flash 核心电压",	false },
+		};
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(tbl); i++) {
+			uint16_t raw;
+			char val[32] = "不可用";
+			const char *note = "";
+
+			if (xadc_read(tbl[i].ch, &raw) == 0) {
+				if (tbl[i].is_temp) {
+					double t = xadc_to_temp(raw);
+
+					snprintf(val, sizeof(val), "%.1f °C", t);
+					note = t >= 95 ? "过高" :
+					       t >= 85 ? "偏高" : "正常";
+				} else {
+					snprintf(val, sizeof(val), "%.2f V",
+						 xadc_to_volt(raw));
+				}
+			}
+			tbl_row(w3, (const char *[]){ tbl[i].name, val, note }, 3);
+		}
+		{
+			char val[32];
+
+			snprintf(val, sizeof(val), "%.1f °C",
+				 pcb_to_temp((uint16_t)rd(PB_REG_PCB_TEMPERATURE)));
+			tbl_row(w3, (const char *[]){ "板卡温度", val, "" }, 3);
+		}
+	}
+	tbl_sep(w3, 3, '-');
+
+	printf("\n");
+	tbl_sep(w3, 3, '-');
+	tbl_row(w3, (const char *[]){ "健康指标", "数值", "说明" }, 3);
+	tbl_sep(w3, 3, '=');
+	{
+		char b1[32], b2[32], b3[32], b4[32];
+		const char *note = stage == PB_STAGE_RUN ? "" : "需固件 RUN";
+
+		if (mon_ok) {
+			snprintf(b1, sizeof(b1), "%u", m.dead_block);
+			snprintf(b2, sizeof(b2), "%u", m.dead_die);
+			snprintf(b3, sizeof(b3), "%u", m.init_count);
+			snprintf(b4, sizeof(b4), "%u", m.start_count);
+		} else {
+			snprintf(b1, sizeof(b1), "不可用");
+			snprintf(b2, sizeof(b2), "不可用");
+			snprintf(b3, sizeof(b3), "不可用");
+			snprintf(b4, sizeof(b4), "不可用");
+		}
+		tbl_row(w3, (const char *[]){ "坏块数", b1, "" }, 3);
+		tbl_row(w3, (const char *[]){ "坏 die 数", b2, "" }, 3);
+		tbl_row(w3, (const char *[]){ "初始化次数", b3, "" }, 3);
+		tbl_row(w3, (const char *[]){ "启动次数", b4, "" }, 3);
+
+		if (mon_ok && stage == PB_STAGE_RUN) {
+			char v[32];
+
+			print_size_cell(v, sizeof(v), m.logical_write * 4096ull);
+			tbl_row(w3, (const char *[]){ "已写入容量", v, "" }, 3);
+			snprintf(v, sizeof(v), "%.2f",
+				 m.logical_write ?
+				 (double)m.flash_write / m.logical_write : 0.0);
+			tbl_row(w3, (const char *[]){ "写放大", v, "" }, 3);
+			tbl_row(w3, (const char *[]){ "只读状态",
+						      m.dead_die ? "是" : "否", "" }, 3);
+		} else {
+			tbl_row(w3, (const char *[]){ "已写入容量", "不可用", note }, 3);
+			tbl_row(w3, (const char *[]){ "写放大", "不可用", note }, 3);
+			tbl_row(w3, (const char *[]){ "剩余寿命", "不可用", note }, 3);
+		}
+	}
+	tbl_sep(w3, 3, '-');
+	printf("\n");
+
+	return mon_ok ? 0 : 1;
 }
+
 
 static void cmd_report(void)
 {
@@ -1028,7 +1281,8 @@ static void usage(const char *prog)
 		"  flowctl  apply vendor flow-control init (phase 2 fallback)\n"
 		"options:\n"
 		"  -d PATH  PCI sysfs resource file (default %s)\n"
-		"  -t MS    mailbox poll timeout in ms (default %d)\n",
+		"  -t MS    mailbox poll timeout in ms (default %d)\n"
+		"  -p       plain key=value output for status (for scripts)\n",
 		prog, PB_DEFAULT_RESOURCE, mb_timeout_ms);
 }
 
@@ -1037,6 +1291,7 @@ int main(int argc, char **argv)
 	const char *path = PB_DEFAULT_RESOURCE;
 	const char *cmd = "report";
 	unsigned int offset = PB_REG_VERSION;
+	bool plain = false;
 	bool readonly;
 	void *map;
 	int status = 0;
@@ -1044,10 +1299,13 @@ int main(int argc, char **argv)
 	int fd;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "d:t:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:t:p")) != -1) {
 		switch (opt) {
 		case 'd':
 			path = optarg;
+			break;
+		case 'p':
+			plain = true;
 			break;
 		case 't': {
 			char *end;
@@ -1125,7 +1383,7 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "report"))
 		cmd_report();
 	else if (!strcmp(cmd, "status"))
-		status = cmd_status(path);
+		status = cmd_status(path, plain);
 	else if (!strcmp(cmd, "dump"))
 		cmd_dump();
 	else if (!strcmp(cmd, "msg"))
