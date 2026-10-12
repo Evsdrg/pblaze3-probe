@@ -28,7 +28,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <linux/pci_regs.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,6 +156,57 @@ static void die(const char *fmt, ...)
 		fprintf(stderr, ": %s", strerror(errno));
 	fputc('\n', stderr);
 	exit(1);
+}
+
+static int pci_preflight(const char *resource)
+{
+	unsigned char config[64];
+	char path[PATH_MAX];
+	char *name;
+	unsigned int vendor, device, command;
+	ssize_t count;
+	int fd;
+
+	if (strlen(resource) >= sizeof(path))
+		return -ENAMETOOLONG;
+	strcpy(path, resource);
+	name = strrchr(path, '/');
+	if (!name || strcmp(name + 1, "resource0"))
+		return -EINVAL;
+	if ((size_t)(name - path) + sizeof("/config") > sizeof(path))
+		return -ENAMETOOLONG;
+	strcpy(name + 1, "config");
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	count = pread(fd, config, sizeof(config), 0);
+	if (count < 0) {
+		int error = errno;
+
+		close(fd);
+		return -error;
+	}
+	close(fd);
+	if (count != (ssize_t)sizeof(config))
+		return -EIO;
+
+	vendor = config[PCI_VENDOR_ID] | config[PCI_VENDOR_ID + 1] << 8;
+	device = config[PCI_DEVICE_ID] | config[PCI_DEVICE_ID + 1] << 8;
+	command = config[PCI_COMMAND] | config[PCI_COMMAND + 1] << 8;
+	if (vendor == 0xffff) {
+		fprintf(stderr, "pbregs: live PCI config is inaccessible; "
+			"refusing BAR access\n");
+		return -ENODEV;
+	}
+	if (vendor != 0x1c5f || device != 0x0530)
+		return -ENODEV;
+	if (!(command & PCI_COMMAND_MEMORY)) {
+		fprintf(stderr, "pbregs: PCI memory decoding is disabled "
+			"(command=0x%04x); refusing BAR access\n", command);
+		return -EACCES;
+	}
+	return 0;
 }
 
 static uint32_t rd(unsigned int off)
@@ -586,14 +640,17 @@ static int cmd_info(void)
  * Single 32-bit MMIO read, nothing else. Used to test whether the card
  * survives plain memory reads toward its BAR.
  */
-static void cmd_peek(int argc, char **argv)
+static int cmd_peek(unsigned int off)
 {
-	unsigned int off = PB_REG_VERSION;
+	uint32_t value = rd(off);
 
-	if (argc > optind)
-		off = (unsigned int)strtoul(argv[optind], NULL, 16);
-
-	printf("peek @0x%03x = 0x%08" PRIx32 "\n", off, rd(off));
+	printf("peek @0x%03x = 0x%08" PRIx32 "\n", off, value);
+	if (value == UINT32_MAX) {
+		fprintf(stderr, "pbregs: MMIO returned all ones; "
+			"device response is unavailable or invalid\n");
+		return 1;
+	}
+	return 0;
 }
 
 static void cmd_flowctl(void)
@@ -609,6 +666,7 @@ static void usage(const char *prog)
 		"Usage: %s [options] [command]\n"
 		"commands:\n"
 		"  report   identity + firmware stage + XADC + PCB temp (default)\n"
+		"  peek [HEX] single read-only 32-bit register read (default offset 0)\n"
 		"  dump     hexdump of BAR0 first 0x100 bytes\n"
 		"  msg      firmware debug message buffer\n"
 		"  rom      mailbox CMD_READROM (phase 2)\n"
@@ -625,7 +683,11 @@ int main(int argc, char **argv)
 {
 	const char *path = PB_DEFAULT_RESOURCE;
 	const char *cmd = "report";
+	unsigned int offset = PB_REG_VERSION;
+	bool readonly;
 	void *map;
+	int status = 0;
+	int ret;
 	int fd;
 	int opt;
 
@@ -634,9 +696,20 @@ int main(int argc, char **argv)
 		case 'd':
 			path = optarg;
 			break;
-		case 't':
-			mb_timeout_ms = atoi(optarg);
+		case 't': {
+			char *end;
+			long timeout;
+
+			errno = 0;
+			timeout = strtol(optarg, &end, 10);
+			if (errno || end == optarg || *end ||
+			    timeout < 1 || timeout > 10000) {
+				fprintf(stderr, "pbregs: timeout must be 1..10000 ms\n");
+				return 1;
+			}
+			mb_timeout_ms = (int)timeout;
 			break;
+		}
 		default:
 			usage(argv[0]);
 			return 1;
@@ -644,18 +717,57 @@ int main(int argc, char **argv)
 	}
 
 	if (optind < argc)
-		cmd = argv[optind];
+		cmd = argv[optind++];
+	if (strcmp(cmd, "peek") && strcmp(cmd, "report") &&
+	    strcmp(cmd, "dump") && strcmp(cmd, "msg") &&
+	    strcmp(cmd, "rom") && strcmp(cmd, "mon") &&
+	    strcmp(cmd, "info") && strcmp(cmd, "flowctl")) {
+		usage(argv[0]);
+		return 1;
+	}
+	if (!strcmp(cmd, "peek") && optind < argc) {
+		char *end;
+		unsigned long parsed;
 
-	fd = open(path, O_RDWR | O_SYNC);
+		errno = 0;
+		parsed = strtoul(argv[optind++], &end, 16);
+		if (errno || end == argv[optind - 1] || *end ||
+		    parsed > PB_BAR_SIZE - sizeof(uint32_t) || (parsed & 3)) {
+			fprintf(stderr, "pbregs: offset must be aligned and within BAR0\n");
+			return 1;
+		}
+		offset = (unsigned int)parsed;
+	}
+	if (optind != argc) {
+		usage(argv[0]);
+		return 1;
+	}
+
+	ret = pci_preflight(path);
+	if (ret) {
+		fprintf(stderr, "pbregs: PCI preflight failed: %s\n",
+			strerror(-ret));
+		return 1;
+	}
+	readonly = !strcmp(cmd, "peek") || !strcmp(cmd, "dump") ||
+		   !strcmp(cmd, "msg");
+	fd = open(path, (readonly ? O_RDONLY : O_RDWR) | O_SYNC | O_CLOEXEC);
 	if (fd < 0)
 		die("cannot open %s (root?)", path);
 
-	map = mmap(NULL, PB_BAR_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
-		   fd, 0);
+	map = mmap(NULL, PB_BAR_SIZE,
+		   readonly ? PROT_READ : PROT_READ | PROT_WRITE,
+		   MAP_SHARED, fd, 0);
 	if (map == MAP_FAILED)
 		die("cannot mmap %s", path);
 	bar = map;
 
+	if (strcmp(cmd, "peek") && rd(PB_REG_VERSION) == UINT32_MAX) {
+		fprintf(stderr, "pbregs: version register returned all ones; "
+			"refusing further register access\n");
+		status = 1;
+		goto out;
+	}
 	if (!strcmp(cmd, "report"))
 		cmd_report();
 	else if (!strcmp(cmd, "dump"))
@@ -663,19 +775,17 @@ int main(int argc, char **argv)
 	else if (!strcmp(cmd, "msg"))
 		cmd_msg();
 	else if (!strcmp(cmd, "rom"))
-		return cmd_rom();
+		status = cmd_rom();
 	else if (!strcmp(cmd, "mon"))
-		return cmd_mon();
+		status = cmd_mon();
 	else if (!strcmp(cmd, "info"))
-		return cmd_info();
+		status = cmd_info();
 	else if (!strcmp(cmd, "flowctl"))
 		cmd_flowctl();
-	else if (!strcmp(cmd, "peek"))
-		cmd_peek(argc, argv);
 	else
-		usage(argv[0]), exit(1);
-
+		status = cmd_peek(offset);
+out:
 	munmap(map, PB_BAR_SIZE);
 	close(fd);
-	return 0;
+	return status;
 }
