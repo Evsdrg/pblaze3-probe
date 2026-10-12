@@ -292,24 +292,29 @@ static int pb_stage_show(struct seq_file *s, void *ignored)
 	return 0;
 }
 
+/*
+ * XADC voltage scale factors, in tenths (scale_num / 10): plain rails
+ * are 1.0, VFlash IO is divided by 1.2 and VFlash core by 2.2 in the
+ * vendor tool (GetVoltage plus its caller).
+ */
 static int pb_xadc_show(struct seq_file *s, void *ignored)
 {
 	static const struct {
 		u8 ch;
 		const char *name;
 		bool is_temp;
-		int scale_num;
+		int scale_tenths;
 	} table[] = {
-		{ PB_XADC_TEMP,		"core_temp_c",	true,	1 },
-		{ PB_XADC_MAX_TEMP,	"core_temp_max_c", true,	1 },
-		{ PB_XADC_MIN_TEMP,	"core_temp_min_c", true,	1 },
-		{ PB_XADC_VCCINT,	"vccint_v",	false,	1 },
-		{ PB_XADC_MAX_VCCINT,	"vccint_max_v",	false,	1 },
-		{ PB_XADC_MIN_VCCINT,	"vccint_min_v",	false,	1 },
-		{ PB_XADC_VCCAUX,	"vccaux_v",	false,	1 },
-		{ PB_XADC_MAX_VCCAUX,	"vccaux_max_v",	false,	1 },
-		{ PB_XADC_MIN_VCCAUX,	"vccaux_min_v",	false,	1 },
-		{ PB_XADC_VDDR3,	"vddr3_v",	false,	1 },
+		{ PB_XADC_TEMP,		"core_temp_c",	true,	10 },
+		{ PB_XADC_MAX_TEMP,	"core_temp_max_c", true,	10 },
+		{ PB_XADC_MIN_TEMP,	"core_temp_min_c", true,	10 },
+		{ PB_XADC_VCCINT,	"vccint_v",	false,	10 },
+		{ PB_XADC_MAX_VCCINT,	"vccint_max_v",	false,	10 },
+		{ PB_XADC_MIN_VCCINT,	"vccint_min_v",	false,	10 },
+		{ PB_XADC_VCCAUX,	"vccaux_v",	false,	10 },
+		{ PB_XADC_MAX_VCCAUX,	"vccaux_max_v",	false,	10 },
+		{ PB_XADC_MIN_VCCAUX,	"vccaux_min_v",	false,	10 },
+		{ PB_XADC_VDDR3,	"vddr3_v",	false,	10 },
 		{ PB_XADC_VFLASH_IO,	"vflash_io_v",	false,	12 },
 		{ PB_XADC_VFLASH_CORE,	"vflash_core_v", false,	22 },
 	};
@@ -339,7 +344,7 @@ static int pb_xadc_show(struct seq_file *s, void *ignored)
 				   whole, frac);
 		} else {
 			u64 uv = (u64)(raw >> 4) * 3000000 / 4096 *
-				 table[i].scale_num / 10;
+				 table[i].scale_tenths / 10;
 
 			seq_printf(s, "%-16s ch 0x%02x raw 0x%04x %llu.%06llu V\n",
 				   table[i].name, table[i].ch, raw,
@@ -355,7 +360,8 @@ static int pb_pcb_temp_show(struct seq_file *s, void *ignored)
 	u16 raw = pb_read(s->private, PB_REG_PCB_TEMPERATURE) &
 		  PB_PCB_TEMP_MASK;
 
-	seq_printf(s, "%d.%d C\n", raw / 128, (raw % 128) * 10 / 128);
+	/* The vendor net scale is raw / 16 (see pbregs pcb_to_temp) */
+	seq_printf(s, "%d.%d C\n", raw / 16, (raw % 16) * 10 / 16);
 
 	return 0;
 }

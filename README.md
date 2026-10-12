@@ -6,21 +6,20 @@
 协议依据：`ref/` 内 2016 年官方驱动源码（`misc-tools/pblaze3-driver/pblaze3-new`
 的原样拷贝，仅作参考，不参与编译）。
 
-## 当前实测状态（2026-10-09）
+## 当前实测状态（2026-10-12）
 
-**通信未打通。** 本机当前为 `7.1.13-aosc-main`；设备实时配置空间全 `0xff`，
-根端口处于 D0 但 `DLActive-`。正确重训练、Gen1 建链测试和一次独立总线热复位
-都未恢复端点应答。本轮未访问 BAR、未发送 ROM／monitor 命令。
-详见 [实测记录及历史位域勘误](RESULTS-2026-10-09.md)。
+**通信已打通。** 简单重启后链路恢复 5GT/s x8 / DLActive+，启用内存解码后
+寄存器与邮箱命令均正常应答。`pbregs status` 可输出 nvidia-smi 风格的
+身份／传感器／链路／健康四组字段。详见 [通信成功记录](RESULTS-2026-10-12.md)。
 
-`pbregs` 已加入实时配置空间／内存解码预检和只读 `peek` 保护。
-下一次须先恢复物理链路；不要直接运行下面的主动查询命令。
-内核模块仅曾针对 `7.1.7` 构建，且尚未做完整运行验证，不能直接加载到当前内核。
+要点：无 NAND 时 L1 寄存器与 L2 邮箱（ROM 身份）可用；依赖闪存/FTL 的
+运行时健康数据（READMON）因固件停在 INIT 阶段而不可用——工具如实标注
+`unavailable`，不伪造零值。
 
 ## 目录结构
 
 - `pbregs.c` → 用户态寄存器/邮箱探针工具 `pbregs`
-- `pblaze_probe.c` → 内核探针模块（目标内核 7.1.7，debugfs 接口，无中断/无 DMA/无块层）
+- `pblaze_probe.c` → 内核探针模块（debugfs 接口，无中断/无 DMA/无块层）
 - `ref/` → 官方驱动参考代码
 
 ## 信息分层（驱动逆向结论）
@@ -38,48 +37,49 @@ gcc -O2 -Wall -Wextra -std=gnu11 -o pbregs pbregs.c   # 用户态工具
 make                                                   # 内核模块
 ```
 
-## 实验步骤（需 root）
+## 使用步骤（需 root）
 
 ```sh
-# 首先做实时 PCI 配置预检和单次只读 MMIO；失败即停止
-sudo ./pbregs peek 0
+# 设备无驱动绑定，需先启用内存解码（内核不会自动做）
+sudo setpci -s 0000:01:00.0 COMMAND=0002:0002
 
-# 以下仅在 peek 有效且设备仍可达时逐条执行，不作为批处理脚本
-sudo ./pbregs msg        # 固件调试消息缓冲区（格式未确认）
-sudo ./pbregs report     # 身份 + 固件状态 + XADC；包含通道选择写操作
+# nvidia-smi 风格汇总：身份 / 传感器 / 链路 / 健康
+sudo ./pbregs status
 
-# 邮箱命令仍待实测验证；失败时不要自动初始化、清状态或升级固件
-sudo ./pbregs rom
-sudo ./pbregs mon
+# 单项查询
+sudo ./pbregs peek 0     # 单次只读寄存器（预检失败即停止）
+sudo ./pbregs report     # 寄存器明细 + XADC（含通道选择写）
+sudo ./pbregs rom        # CMD_READROM 完整键值
+sudo ./pbregs mon        # CMD_READMON 原始健康块
+sudo ./pbregs msg        # 固件调试消息缓冲区
 ```
 
-原工具仍保留 `info` 和 `flowctl` 实验命令，但不是当前的恢复步骤。
-内核模块加载、主动 flow-control 初始化和其他写操作须单独审核后再测。
-
 `pbregs` 可用 `-t 毫秒` 调整邮箱超时（默认 200ms；官方驱动是 5 分钟死等）。
+原工具保留 `info`、`flowctl`、`dump` 实验命令。内核模块加载与主动
+flow-control 初始化等写操作须单独审核后再测。
 
 ## 判读标准
 
-- `report` 中 MB0/MB1 的 **stage** 字段：`INIT`=固件未就绪，`READY`=固件就绪待命，
-  `RUN`=完全运行。无 NAND 时卡在 INIT 属预期可能结果。
-- XADC 核心温度合理范围约 30~60°C；若各通道全是 0x0000/0xffff 需怀疑读序列。
-- `rom`／`mon` 超时只表示该查询未完成，不能证明固件必须有 NAND 才能运行。
-- `rom` 成功仅证明身份查询路径可用；`mon` 的协议完成和数据有效性须独立验证。
-- 配置空间或 MMIO 全一不是合法温度／生命周期结果，不应将其解码成正常状态。
+- `status` 的 `FirmwareStage`：`INIT`=固件未就绪，`READY`=就绪待命，
+  `RUN`=完全运行。**无 NAND 时停在 INIT**，此时 `health` 组标注 `unavailable`。
+- `Status=Online` 仅当固件进入 RUN。`PCIeLink` 来自实时配置空间。
+- XADC 电压应接近 FPGA 标称值（VCCINT≈1.0V、VCCAUX≈1.8V、VDDR≈1.5V）；
+  数值明显偏离或全 0／全 1 说明读序列或链路有问题。
+- `rom`／`mon` 超时只表示该查询未完成，不能据此断言固件必须有 NAND 才能运行。
+- 配置空间或 MMIO 全一不是合法数据，工具会拒绝而非解码成正常状态。
 
-## 实测结果（待填）
+## 实测结果（2026-10-12）
 
-| 项目 | 结果 | 备注 |
-|------|------|------|
-| FPGA version | | |
-| 编译日期/时间 | | |
-| MB0 stage | | |
-| MB1 stage | | |
-| XADC core temp | | |
-| PCB temp | | |
-| msg 缓冲区内容 | | |
-| READROM | | |
-| READMON | | |
-| flowctl 后重试 | | |
-| 内核模块 stage/xadc | | |
-| 内核模块 rom/monitor | | |
+| 项目 | 结果 |
+|------|------|
+| FPGA 位流编译日期/时间 | 2015-10-17 05:32:39 |
+| Model / SN | PB3LM150T12 / MH15227248 |
+| 固件版本 | 01.06.5101RTM (2015-10-19) |
+| Flash 型号 | Toshiba TH58TFT0DFKBA8J (MLC) |
+| PCIe 链路 | x8 Gen2 (5GT/s), DLActive+ |
+| 核心温度 / 板温 | 98.8°C / 58.2°C |
+| VCCINT / VCCAUX / VDDR | 1.01V / 1.80V / 1.49V |
+| 固件 stage | INIT（Offline） |
+| READROM | 成功（MB1） |
+| READMON | 完成但全零（固件未初始化） |
+| 健康/性能数据 | unavailable（依赖 FTL，无 NAND 不产生） |

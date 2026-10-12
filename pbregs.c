@@ -93,6 +93,14 @@ enum pb_stage {
 #define PB_CMD_CLEARINT		0x0a
 #define PB_CMD_CLEARALERT	0x1c
 
+/* Firmware status codes echoed by CMD_ENDCMD */
+#define PB_CMD_ECHO_SUCCEED		0
+#define PB_CMD_ECHO_FAILED		1
+#define PB_CMD_ECHO_INVALID_PARMA	2
+#define PB_CMD_ECHO_INVALID_DEVICE	3
+#define PB_CMD_ECHO_PROBE_NO_FINISH	4
+#define PB_CMD_ECHO_MALLOC_FAILED	5
+
 #define PB_IS_MAJORCMD(cmd)	((cmd) >= 0x01 && (cmd) <= 0x20)
 
 /* XADC channels */
@@ -123,6 +131,8 @@ enum pb_stage {
 #define PB_WRITE_FC_EN_ADDR	0x100000fu
 
 #define PB_ROM_SIZE		4096
+/* struct pblaze_print_info on the wire: 3 u16 + 80 u32 (ref header) */
+#define PB_PRINT_INFO_SIZE	328
 
 /* The card's health block, ref/driver/pblaze_hal.h struct pblaze_monitor */
 struct pb_monitor {
@@ -158,38 +168,56 @@ static void die(const char *fmt, ...)
 	exit(1);
 }
 
-static int pci_preflight(const char *resource)
+/*
+ * Derive the PCI config file path from a resource file path, so the
+ * tool can read live configuration space without hardcoding a BDF.
+ */
+static int pb_config_path(const char *resource, char *out, size_t outlen)
 {
-	unsigned char config[64];
-	char path[PATH_MAX];
 	char *name;
-	unsigned int vendor, device, command;
-	ssize_t count;
-	int fd;
 
-	if (strlen(resource) >= sizeof(path))
+	if (strlen(resource) >= outlen)
 		return -ENAMETOOLONG;
-	strcpy(path, resource);
-	name = strrchr(path, '/');
+	strcpy(out, resource);
+	name = strrchr(out, '/');
 	if (!name || strcmp(name + 1, "resource0"))
 		return -EINVAL;
-	if ((size_t)(name - path) + sizeof("/config") > sizeof(path))
+	if ((size_t)(name - out) + sizeof("/config") > outlen)
 		return -ENAMETOOLONG;
 	strcpy(name + 1, "config");
+	return 0;
+}
+
+static int pb_read_config(const char *resource, unsigned int off, void *buf,
+			  size_t len)
+{
+	char path[PATH_MAX];
+	ssize_t count;
+	int fd;
+	int ret;
+
+	ret = pb_config_path(resource, path, sizeof(path));
+	if (ret)
+		return ret;
 
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -errno;
-	count = pread(fd, config, sizeof(config), 0);
-	if (count < 0) {
-		int error = errno;
-
-		close(fd);
-		return -error;
-	}
+	count = pread(fd, buf, len, off);
+	ret = (count == (ssize_t)len) ? 0 : -EIO;
 	close(fd);
-	if (count != (ssize_t)sizeof(config))
-		return -EIO;
+	return ret;
+}
+
+static int pci_preflight(const char *resource)
+{
+	unsigned char config[64];
+	unsigned int vendor, device, command;
+	int ret;
+
+	ret = pb_read_config(resource, 0, config, sizeof(config));
+	if (ret)
+		return ret;
 
 	vendor = config[PCI_VENDOR_ID] | config[PCI_VENDOR_ID + 1] << 8;
 	device = config[PCI_DEVICE_ID] | config[PCI_DEVICE_ID + 1] << 8;
@@ -207,6 +235,60 @@ static int pci_preflight(const char *resource)
 		return -EACCES;
 	}
 	return 0;
+}
+
+/*
+ * Negotiated link width and generation, from the PCIe capability in
+ * live config space. Mirrors pblaze_pcie_get_link_status().
+ */
+static int pb_link_status(const char *resource, int *width, int *gen)
+{
+	unsigned char hdr[64], cap[4];
+	unsigned int off;
+	int i;
+	int ret;
+
+	ret = pb_read_config(resource, 0, hdr, sizeof(hdr));
+	if (ret)
+		return ret;
+
+	off = hdr[PCI_CAPABILITY_LIST] & 0xfc;
+	for (i = 0; i < 48 && off >= 0x40; i++) {
+		unsigned char lnk[2];
+		unsigned int val;
+
+		ret = pb_read_config(resource, off, cap, sizeof(cap));
+		if (ret)
+			return ret;
+
+		if (cap[PCI_CAP_LIST_ID] == PCI_CAP_ID_EXP) {
+			ret = pb_read_config(resource, off + PCI_EXP_LNKSTA,
+					     lnk, sizeof(lnk));
+			if (ret)
+				return ret;
+			val = lnk[0] | lnk[1] << 8;
+			*width = (val & PCI_EXP_LNKSTA_NLW) >> 4;
+			switch (val & PCI_EXP_LNKSTA_CLS) {
+			case PCI_EXP_LNKSTA_CLS_2_5GB:
+				*gen = 1;
+				break;
+			case PCI_EXP_LNKSTA_CLS_5_0GB:
+				*gen = 2;
+				break;
+			case PCI_EXP_LNKSTA_CLS_8_0GB:
+				*gen = 3;
+				break;
+			default:
+				*gen = 0;
+				break;
+			}
+			return 0;
+		}
+
+		off = cap[PCI_CAP_LIST_NEXT] & 0xfc;
+	}
+
+	return -ENOENT;
 }
 
 static uint32_t rd(unsigned int off)
@@ -244,9 +326,14 @@ static double xadc_to_volt(uint16_t raw)
 	return (double)(raw >> 4) * (3.0 / 4096.0);
 }
 
+/*
+ * PCB temperature. The vendor driver reads the 13-bit sensor field and
+ * shifts it left by 3 (pblaze_read_pcb_temperature), then the tool
+ * divides by 128 (GetOnboardTemperature); the net scale is raw / 16.
+ */
 static double pcb_to_temp(uint16_t raw)
 {
-	return (double)(raw & PB_PCB_TEMP_MASK) / 128.0;
+	return (double)(raw & PB_PCB_TEMP_MASK) / 16.0;
 }
 
 /*
@@ -346,9 +433,13 @@ static void mb_send_end(unsigned int mb)
  * Multi-word mailbox command, reproducing pblaze_comm_imm(): major
  * command first, then len 16-bit words carried by alternating
  * CMD_DATA1/CMD_DATA2, then CMD_ENDCMD and CMD_EXITINT.
+ *
+ * The data field echoed by CMD_ENDCMD carries the firmware's status
+ * code for the command (CMD_ECHO_* in the vendor driver); it is
+ * returned through @status when non-NULL.
  */
 static int mb_comm(unsigned int mb, uint32_t cmd, size_t len_bytes,
-		   uint16_t *buf)
+		   uint16_t *buf, uint16_t *status)
 {
 	size_t words = len_bytes / sizeof(uint16_t);
 	size_t i;
@@ -366,12 +457,32 @@ static int mb_comm(unsigned int mb, uint32_t cmd, size_t len_bytes,
 			return ret;
 	}
 
-	ret = mb_xfer(mb, PB_CMD_ENDCMD, 0, NULL);
+	ret = mb_xfer(mb, PB_CMD_ENDCMD, 0, status);
 	if (ret)
 		return ret;
 
 	mb_send_end(mb);
 	return 0;
+}
+
+static const char *cmd_status_name(uint16_t status)
+{
+	switch (status) {
+	case PB_CMD_ECHO_SUCCEED:
+		return "succeed";
+	case PB_CMD_ECHO_FAILED:
+		return "failed";
+	case PB_CMD_ECHO_INVALID_PARMA:
+		return "invalid parameter";
+	case PB_CMD_ECHO_INVALID_DEVICE:
+		return "invalid device";
+	case PB_CMD_ECHO_PROBE_NO_FINISH:
+		return "probe not finished";
+	case PB_CMD_ECHO_MALLOC_FAILED:
+		return "malloc failed";
+	default:
+		return "unknown";
+	}
 }
 
 /* Apply the vendor flow-control init sequence, ref pblaze_pcie.c:1235 */
@@ -436,6 +547,214 @@ static uint64_t u64_from_words64(const uint16_t *w)
 	       ((uint64_t)(uint32_t)w[1] << 16) |
 	       ((uint64_t)(uint32_t)w[2] << 32) |
 	       ((uint64_t)(uint32_t)w[3] << 48);
+}
+
+/*
+ * Look up a key in the ROM key/value text, mirroring pb_get_str_by_key():
+ * entries are NUL-terminated key and value strings in sequence.
+ */
+static const char *rom_str(const char *rom, const char *key)
+{
+	const char *p = rom;
+	const char *end = rom + PB_ROM_SIZE;
+
+	while (p < end && *p) {
+		size_t klen = strnlen(p, (size_t)(end - p));
+
+		if (klen == strlen(key) && !memcmp(p, key, klen) &&
+		    p + klen + 1 < end)
+			return p + klen + 1;
+		p += klen + 1;
+		if (p >= end)
+			break;
+		p += strnlen(p, (size_t)(end - p)) + 1;
+	}
+
+	return NULL;
+}
+
+static long long rom_int(const char *rom, const char *key)
+{
+	const char *v = rom_str(rom, key);
+
+	return v ? strtoll(v, NULL, 10) : 0;
+}
+
+static void print_size(const char *name, unsigned long long bytes)
+{
+	static const char *const unit[] = { "B", "KB", "MB", "GB", "TB" };
+	double val = (double)bytes;
+	int i = 0;
+
+	while (val >= 1024.0 && i < (int)ARRAY_SIZE(unit) - 1) {
+		val /= 1024.0;
+		i++;
+	}
+	printf("%s=%.2f%s\n", name, val, unit[i]);
+}
+
+/*
+ * nvidia-smi style summary. Groups A (ROM identity), B (sensors) and
+ * C (link/status) are always printed. Group D (health/performance) is
+ * printed only when the firmware has reached RUN; otherwise it is
+ * reported as unavailable rather than as zeroes.
+ */
+static int cmd_status(const char *path)
+{
+	static uint16_t rombuf[PB_ROM_SIZE / sizeof(uint16_t)];
+	static uint16_t monbuf[sizeof(struct pb_monitor) / sizeof(uint16_t)];
+	const char *rom = (const char *)rombuf;
+	struct pb_monitor m;
+	uint16_t status;
+	uint32_t mb0, mb1, stage;
+	int width = 0, gen = 0;
+	bool rom_ok = false;
+	bool mon_ok = false;
+
+	mb0 = rd(PB_REG_READ_MB0);
+	mb1 = rd(PB_REG_READ_MB1);
+	stage = (mb1 >> PB_ST_STAGE_SHIFT) & 3u;
+	if (stage == PB_STAGE_INIT && ((mb0 >> PB_ST_STAGE_SHIFT) & 3u) != PB_STAGE_INIT)
+		stage = (mb0 >> PB_ST_STAGE_SHIFT) & 3u;
+
+	/* Group A: identity from ROM (MB1 answers on this card) */
+	memset(rombuf, 0, sizeof(rombuf));
+	if (mb_comm(1, PB_CMD_READROM, PB_ROM_SIZE, rombuf, &status) == 0 &&
+	    status == PB_CMD_ECHO_SUCCEED)
+		rom_ok = true;
+	else {
+		memset(rombuf, 0, sizeof(rombuf));
+		if (mb_comm(0, PB_CMD_READROM, PB_ROM_SIZE, rombuf, &status) == 0 &&
+		    status == PB_CMD_ECHO_SUCCEED)
+			rom_ok = true;
+	}
+
+	printf("===== identity =====\n");
+	if (rom_ok) {
+		const char *model = rom_str(rom, "Model:");
+
+		printf("Model=%s\n", model ? model : "?");
+		printf("SerialNumber=%s\n",
+		       rom_str(rom, "Serial Number:") ?: "?");
+		printf("FirmwareVersion=%s\n",
+		       rom_str(rom, "Firmware Version:") ?: "?");
+		print_size("FirmwareSize",
+			   (unsigned long long)rom_int(rom, "Firmware Size:"));
+		printf("FlashCell=%s\n", rom_str(rom, "Flash Cell:") ?: "?");
+		printf("FlashType=%s\n", rom_str(rom, "Flash Type:") ?: "?");
+		printf("MotherCardPN=%s\n",
+		       rom_str(rom, "Mother Card PN:") ?: "?");
+		if (model && strlen(model) > 3) {
+			if (model[3] == 'H')
+				printf("FormFactor=Half-length,full-height\n");
+			else if (model[3] == 'L')
+				printf("FormFactor=Half-length,half-height\n");
+		}
+	} else {
+		printf("Model=unavailable (ROM read failed)\n");
+	}
+	printf("DeviceIndex=%lld\n", rom_int(rom, "DeviceIndex:"));
+
+	/* Group B: sensors (XADC + PCB) */
+	printf("===== sensors =====\n");
+	{
+		static const struct {
+			uint8_t ch;
+			const char *name;
+			bool is_temp;
+		} tbl[] = {
+			{ PB_XADC_TEMP,		"CoreTemperature",	true },
+			{ PB_XADC_MAX_TEMP,	"MaxCoreTemperature",	true },
+			{ PB_XADC_MIN_TEMP,	"MinCoreTemperature",	true },
+			{ PB_XADC_VCCINT,	"VCore",		false },
+			{ PB_XADC_VCCAUX,	"VPeripheral",		false },
+			{ PB_XADC_VDDR3,	"VDDR",			false },
+			{ PB_XADC_VFLASH_IO,	"VFlash",		false },
+			{ PB_XADC_VFLASH_CORE,	"VFlashCore",		false },
+		};
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(tbl); i++) {
+			uint16_t raw;
+
+			if (xadc_read(tbl[i].ch, &raw)) {
+				printf("%s=unavailable\n", tbl[i].name);
+				continue;
+			}
+			if (tbl[i].is_temp)
+				printf("%s=%.1fC\n", tbl[i].name,
+				       xadc_to_temp(raw));
+			else
+				printf("%s=%.2fV\n", tbl[i].name,
+				       xadc_to_volt(raw));
+		}
+		printf("BoardTemperature=%.1fC\n",
+		       pcb_to_temp((uint16_t)rd(PB_REG_PCB_TEMPERATURE)));
+	}
+
+	/* Group C: link and status */
+	printf("===== status =====\n");
+	if (pb_link_status(path, &width, &gen) == 0)
+		printf("PCIeLink=%d(v%d)\n", width, gen);
+	else
+		printf("PCIeLink=unavailable\n");
+	printf("FirmwareStage=%s\n", stage_name(stage));
+	printf("Status=%s\n", stage == PB_STAGE_RUN ? "Online" : "Offline");
+
+	/* Group D: health/performance, only meaningful once running */
+	printf("===== health =====\n");
+	memset(monbuf, 0, sizeof(monbuf));
+	if (mb_comm(1, PB_CMD_READMON, sizeof(monbuf), monbuf, &status) == 0 &&
+	    status == PB_CMD_ECHO_SUCCEED)
+		mon_ok = true;
+	else {
+		memset(monbuf, 0, sizeof(monbuf));
+		if (mb_comm(0, PB_CMD_READMON, sizeof(monbuf), monbuf, &status) == 0 &&
+		    status == PB_CMD_ECHO_SUCCEED)
+			mon_ok = true;
+	}
+
+	if (!mon_ok) {
+		printf("DeviceHealth=unavailable (READMON failed)\n");
+		return 1;
+	}
+
+	m.logical_read = u64_from_words64(monbuf + 0);
+	m.flash_read = u64_from_words64(monbuf + 4);
+	m.logical_write = u64_from_words64(monbuf + 8);
+	m.flash_write = u64_from_words64(monbuf + 12);
+	m.dead_block = (uint32_t)u64_from_words(monbuf + 18);
+	m.dead_die = monbuf[20];
+	m.init_count = monbuf[21];
+	m.start_count = monbuf[22];
+	m.over_heating = monbuf[23];
+	m.tetris_size_in_system = monbuf[24];
+
+	if (stage != PB_STAGE_RUN) {
+		printf("DeviceHealth=unavailable (firmware stage %s, "
+		       "not RUN)\n", stage_name(stage));
+		printf("DeviceDeadBlocks=%u\n", m.dead_block);
+		printf("DeviceDeadDies=%u\n", m.dead_die);
+		printf("InitializationCounts=%u\n", m.init_count);
+		printf("StartupCounts=%u\n", m.start_count);
+		printf("DeviceRemainLife=unavailable\n");
+		printf("AlreadyReadCapacity=unavailable\n");
+		printf("AlreadyWriteCapacity=unavailable\n");
+		printf("WriteAmplification=unavailable\n");
+		return 0;
+	}
+
+	print_size("AlreadyReadCapacity", m.logical_read * 4096ull);
+	print_size("AlreadyWriteCapacity", m.logical_write * 4096ull);
+	printf("WriteAmplification=%.2f\n",
+	       m.logical_write ? (double)m.flash_write / m.logical_write : 0.0);
+	printf("DeviceDeadBlocks=%u\n", m.dead_block);
+	printf("DeviceDeadDies=%u\n", m.dead_die);
+	printf("InitializationCounts=%u\n", m.init_count);
+	printf("StartupCounts=%u\n", m.start_count);
+	printf("ReadOnly=%s\n", m.dead_die ? "Yes" : "No");
+
+	return 0;
 }
 
 static void cmd_report(void)
@@ -553,23 +872,32 @@ static int cmd_rom(void)
 {
 	static uint16_t buf[PB_ROM_SIZE / sizeof(uint16_t)];
 	unsigned int mb;
+	bool any_ok = false;
 	int ret;
 
 	for (mb = 0; mb < 2; mb++) {
+		uint16_t status;
+
 		memset(buf, 0, sizeof(buf));
 		printf("== CMD_READROM via MB%u ==\n", mb);
 
-		ret = mb_comm(mb, PB_CMD_READROM, PB_ROM_SIZE, buf);
+		ret = mb_comm(mb, PB_CMD_READROM, PB_ROM_SIZE, buf, &status);
 		if (ret) {
 			printf("  mailbox timeout after %d ms\n",
 			       mb_timeout_ms);
 			continue;
 		}
+		if (status != PB_CMD_ECHO_SUCCEED) {
+			printf("  firmware status %u (%s)\n", status,
+			       cmd_status_name(status));
+			continue;
+		}
 
+		any_ok = true;
 		print_rom((const char *)buf);
 	}
 
-	return 0;
+	return any_ok ? 0 : 1;
 }
 
 /* Phase 2: CMD_READMON, the card's "SMART" block. */
@@ -578,19 +906,28 @@ static int cmd_mon(void)
 	static uint16_t buf[sizeof(struct pb_monitor) / sizeof(uint16_t)];
 	struct pb_monitor m;
 	unsigned int mb;
+	bool any_ok = false;
 	int ret;
 
 	for (mb = 0; mb < 2; mb++) {
+		uint16_t status;
+
 		memset(buf, 0, sizeof(buf));
 		printf("== CMD_READMON via MB%u ==\n", mb);
 
-		ret = mb_comm(mb, PB_CMD_READMON, sizeof(buf), buf);
+		ret = mb_comm(mb, PB_CMD_READMON, sizeof(buf), buf, &status);
 		if (ret) {
 			printf("  mailbox timeout after %d ms\n",
 			       mb_timeout_ms);
 			continue;
 		}
+		if (status != PB_CMD_ECHO_SUCCEED) {
+			printf("  firmware status %u (%s)\n", status,
+			       cmd_status_name(status));
+			continue;
+		}
 
+		any_ok = true;
 		m.logical_read = u64_from_words64(buf + 0);
 		m.flash_read = u64_from_words64(buf + 4);
 		m.logical_write = u64_from_words64(buf + 8);
@@ -608,32 +945,47 @@ static int cmd_mon(void)
 		print_monitor(&m);
 	}
 
-	return 0;
+	return any_ok ? 0 : 1;
 }
 
 /* Phase 2: CMD_READINFO, firmware push message. */
 static int cmd_info(void)
 {
-	uint16_t buf[(sizeof(uint32_t) * 16 + 256) / sizeof(uint16_t) + 3];
+	/*
+	 * struct pblaze_print_info is 328 bytes: 3 u16 header fields
+	 * followed by a u32 value[] array (see ref header). The array
+	 * itself is 16 + 256/4 = 80 u32 = 320 bytes, and the u32 forces
+	 * 4-byte alignment after the 6-byte header, so the trailing u16
+	 * in the wire stream is padding.
+	 */
+	uint16_t buf[PB_PRINT_INFO_SIZE / sizeof(uint16_t)];
 	unsigned int mb;
+	bool any_ok = false;
 	int ret;
 
-	/* struct pblaze_print_info: u16 x3 header + values, see ref header */
 	for (mb = 0; mb < 2; mb++) {
+		uint16_t status;
+
 		memset(buf, 0, sizeof(buf));
 		printf("== CMD_READINFO via MB%u ==\n", mb);
 
-		ret = mb_comm(mb, PB_CMD_READINFO, sizeof(buf), buf);
+		ret = mb_comm(mb, PB_CMD_READINFO, sizeof(buf), buf, &status);
 		if (ret) {
 			printf("  mailbox timeout after %d ms\n",
 			       mb_timeout_ms);
 			continue;
 		}
+		if (status != PB_CMD_ECHO_SUCCEED) {
+			printf("  firmware status %u (%s)\n", status,
+			       cmd_status_name(status));
+			continue;
+		}
 
+		any_ok = true;
 		printf("  infolen=%u paramlen=%u strlen=%u\n",
 		       buf[0], buf[1], buf[2]);
 	}
-	return 0;
+	return any_ok ? 0 : 1;
 }
 
 /*
@@ -666,6 +1018,7 @@ static void usage(const char *prog)
 		"Usage: %s [options] [command]\n"
 		"commands:\n"
 		"  report   identity + firmware stage + XADC + PCB temp (default)\n"
+		"  status   nvidia-smi style summary (identity/sensors/status/health)\n"
 		"  peek [HEX] single read-only 32-bit register read (default offset 0)\n"
 		"  dump     hexdump of BAR0 first 0x100 bytes\n"
 		"  msg      firmware debug message buffer\n"
@@ -719,9 +1072,10 @@ int main(int argc, char **argv)
 	if (optind < argc)
 		cmd = argv[optind++];
 	if (strcmp(cmd, "peek") && strcmp(cmd, "report") &&
-	    strcmp(cmd, "dump") && strcmp(cmd, "msg") &&
-	    strcmp(cmd, "rom") && strcmp(cmd, "mon") &&
-	    strcmp(cmd, "info") && strcmp(cmd, "flowctl")) {
+	    strcmp(cmd, "status") && strcmp(cmd, "dump") &&
+	    strcmp(cmd, "msg") && strcmp(cmd, "rom") &&
+	    strcmp(cmd, "mon") && strcmp(cmd, "info") &&
+	    strcmp(cmd, "flowctl")) {
 		usage(argv[0]);
 		return 1;
 	}
@@ -770,6 +1124,8 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(cmd, "report"))
 		cmd_report();
+	else if (!strcmp(cmd, "status"))
+		status = cmd_status(path);
 	else if (!strcmp(cmd, "dump"))
 		cmd_dump();
 	else if (!strcmp(cmd, "msg"))
