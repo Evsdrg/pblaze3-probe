@@ -753,7 +753,7 @@ static int cmd_status(const char *path, bool plain)
 	const char *formfactor = "未知";
 	char ts[32], fwsize[32] = "?", busid[32] = "?";
 	char dev0[80], dev1[80], dev2[80], link[32], stg[32], health[32];
-	char capacity[32] = "不可用";
+	char capacity[32], ff_cell[32];
 	const char *stg_cn;
 	int width = 0, gen = 0;
 	bool rom_ok = false, mon_ok = false, link_ok;
@@ -868,8 +868,8 @@ static int cmd_status(const char *path, bool plain)
 
 	pb_bdf_from_path(path, busid, sizeof(busid));
 
-	snprintf(dev0, sizeof(dev0), "  0  %s", model);
-	snprintf(dev1, sizeof(dev1), "     %s", sn);
+	snprintf(dev0, sizeof(dev0), "型号  %s", model);
+	snprintf(dev1, sizeof(dev1), "序列号  %s", sn);
 	/* keep only the version token; the full string has a build date */
 	{
 		char shortver[64];
@@ -881,35 +881,38 @@ static int cmd_status(const char *path, bool plain)
 		} else {
 			snprintf(shortver, sizeof(shortver), "%s", fwver);
 		}
-		snprintf(dev2, sizeof(dev2), "     %s", shortver);
+		snprintf(dev2, sizeof(dev2), "固件版本  %s", shortver);
 	}
 	if (link_ok)
-		snprintf(link, sizeof(link), "x%d Gen%d", width, gen);
+		snprintf(link, sizeof(link), "链路  x%d Gen%d", width, gen);
 	else
-		snprintf(link, sizeof(link), "不可用");
+		snprintf(link, sizeof(link), "链路  不可用");
 
 	stg_cn = stage == PB_STAGE_RUN ? "运行 (RUN)" :
 		 stage == PB_STAGE_READY ? "就绪 (READY)" :
 		 stage == PB_STAGE_INIT ? "初始化 (INIT)" : "保留";
-	snprintf(stg, sizeof(stg), "%s", stg_cn);
-	snprintf(health, sizeof(health), "%s",
+	snprintf(stg, sizeof(stg), "固件阶段  %s", stg_cn);
+	snprintf(health, sizeof(health), "健康状态  %s",
 		 stage == PB_STAGE_RUN ? "在线" : "离线");
-	if (mon_ok && stage == PB_STAGE_RUN)
-		print_size_cell(capacity, sizeof(capacity),
-				rom_max_capacity(rom, m.tetris_size_in_system));
+	snprintf(ff_cell, sizeof(ff_cell), "规格  %s", formfactor);
+	{
+		char capval[24] = "不可用";
+
+		if (mon_ok && stage == PB_STAGE_RUN)
+			print_size_cell(capval, sizeof(capval),
+					rom_max_capacity(rom,
+						m.tetris_size_in_system));
+		snprintf(capacity, sizeof(capacity), "容量  %s", capval);
+	}
 
 	printf("\n");
 	tbl_sep(w3, 3, '-');
 	tbl_banner(inner, "Memblaze PBlaze3 状态监控", ts);
-	tbl_banner(inner, "固件版本: " , "工具: pbregs");
-	tbl_sep(w3, 3, '-');
-	tbl_row(w3, (const char *[]){ "设备  型号", "总线地址", "链路状态" }, 3);
-	tbl_row(w3, (const char *[]){ "      序列号", "固件阶段", "健康状态" }, 3);
-	tbl_row(w3, (const char *[]){ "      固件版本", "容量", "规格" }, 3);
+	tbl_banner(inner, busid, "工具: pbregs");
 	tbl_sep(w3, 3, '=');
-	tbl_row(w3, (const char *[]){ dev0, busid, link }, 3);
-	tbl_row(w3, (const char *[]){ dev1, stg, health }, 3);
-	tbl_row(w3, (const char *[]){ dev2, capacity, formfactor }, 3);
+	tbl_row(w3, (const char *[]){ dev0, stg, link }, 3);
+	tbl_row(w3, (const char *[]){ dev1, health, ff_cell }, 3);
+	tbl_row(w3, (const char *[]){ dev2, capacity, "" }, 3);
 	tbl_sep(w3, 3, '-');
 
 	printf("\n");
