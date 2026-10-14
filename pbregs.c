@@ -19,7 +19,7 @@
  *   - CMD_READMON  : struct pblaze_monitor (the card's "SMART")
  *
  * The mailbox handshake reproduces pblaze_send_cmd_imm() /
- * pblaze_comm_imm() from the 2016 vendor driver (ref/pblaze_pcie.c),
+ * pblaze_comm_imm() from the 2016 vendor driver (see PROTOCOL.md),
  * with bounded timeouts instead of the original 5-minute spin.
  *
  * Copyright (C) 2026 pblaze3-probe authors
@@ -46,7 +46,7 @@
 #define PB_DEFAULT_RESOURCE	"/sys/bus/pci/devices/0000:01:00.0/resource0"
 #define PB_BAR_SIZE		0x10000
 
-/* Register map, from ref/driver/pblaze_pcie.h */
+/* Register map, from PROTOCOL.md */
 #define PB_REG_VERSION		0x000
 #define PB_REG_WRITE_MB0	0x010
 #define PB_REG_READ_MB0		0x014
@@ -134,7 +134,7 @@ enum pb_stage {
 /* struct pblaze_print_info on the wire: 3 u16 + 80 u32 (ref header) */
 #define PB_PRINT_INFO_SIZE	328
 
-/* The card's health block, ref/driver/pblaze_hal.h struct pblaze_monitor */
+/* The card's health block (struct pblaze_monitor, see PROTOCOL.md) */
 struct pb_monitor {
 	uint64_t logical_read;
 	uint64_t flash_read;
@@ -340,7 +340,7 @@ static double pcb_to_temp(uint16_t raw)
  * XADC channel-select read. The channel number is written to bits
  * [22:16]; the FPGA echoes it back once the sample is latched, and the
  * 16-bit conversion result sits in bits [15:0]. This mirrors
- * pblaze_read_xadc_value() in ref/driver/pblaze_raid.c.
+ * pblaze_read_xadc_value() in the vendor driver; see PROTOCOL.md.
  */
 static int xadc_read(uint8_t ch, uint16_t *out)
 {

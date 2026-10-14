@@ -1,95 +1,143 @@
 # pblaze3-probe
 
-与一块**已移除 NAND 闪存颗粒**的 Memblaze PBlaze3 原型卡（FPGA 主控，PCI ID
-`1c5f:0530`，本机 0000:01:00.0）建立通信，并尝试获取其 SMART 等价健康信息。
+面向 **Memblaze PBlaze3** PCIe SSD（FPGA 主控的原型固态盘，PCI ID `1c5f:0530`）
+的诊断与探测工具，用于在**闪存颗粒已被移除**的卡上：
 
-协议依据：`ref/` 内 2016 年官方驱动源码（`misc-tools/pblaze3-driver/pblaze3-new`
-的原样拷贝，仅作参考，不参与编译）。
+- 读取 FPGA 寄存器（位流编译日期、XADC 片内温度/电压、板卡温度）
+- 通过私有邮箱协议读取 ROM 身份信息与健康监控数据
+- 以 `nvidia-smi` 风格输出结构化状态汇总
 
-## 当前实测状态（2026-10-12）
+适用于老硬件逆向、二手卡验机，或在没有可用驱动时确认卡是否还能通信。
 
-**通信已打通。** 简单重启后链路恢复 5GT/s x8 / DLActive+，启用内存解码后
-寄存器与邮箱命令均正常应答。`pbregs status` 可输出 nvidia-smi 风格的
-身份／传感器／链路／健康四组字段。详见 [通信成功记录](RESULTS-2026-10-12.md)。
+> 本项目**不含**任何第三方厂商代码。协议实现基于对公开上游驱动的阅读与
+> 实机验证，整理在 [`PROTOCOL.md`](PROTOCOL.md)。厂商驱动可由
+> [`scripts/fetch-vendor-driver.sh`](scripts/fetch-vendor-driver.sh) 按需拉取。
 
-要点：无 NAND 时 L1 寄存器与 L2 邮箱（ROM 身份）可用；依赖闪存/FTL 的
-运行时健康数据（READMON）因固件停在 INIT 阶段而不可用——工具如实标注
-`unavailable`，不伪造零值。
+## 背景
 
-## 目录结构
+PBlaze3 是 Memblaze（现忆恒创源）约 2015 年的 PCIe 加速卡，主控由 Xilinx FPGA
+实现，协议为厂商私有（并非 NVMe）。官方 Linux 驱动只支持到较老的内核，
+早已不再维护，这类卡如今多半只能当废件。
 
-- `pbregs.c` → 用户态寄存器/邮箱探针工具 `pbregs`
-- `pblaze_probe.c` → 内核探针模块（debugfs 接口，无中断/无 DMA/无块层）
-- `ref/` → 官方驱动参考代码
+本项目的起点是一块**已拆除 NAND 颗粒**的 PBlaze3（板上只剩 FPGA 与 DRAM）。
+目标不是让它恢复成可用的盘，而是回答一个具体问题：
 
-## 信息分层（驱动逆向结论）
+> 一块没有闪存的 PBlaze3，主机还能和它通信到什么程度？
 
-| 层 | 内容 | 依赖 |
-|----|------|------|
-| L1 寄存器通道 | FPGA 版本、位流编译日期、固件生命周期 ST_STAGE、XADC 温度电压、PCB 温度、固件调试消息缓冲 | 需 PCIe 链路有效、内存解码已启用、BAR 能应答；XADC 查询需写通道选择寄存器 |
-| L2 邮箱命令 | CMD_READROM(0x7) 4KB 身份键值、CMD_READMON(0x6) 健康计数（即本卡的 "SMART"） | 需卡上固件应答（无 NAND 时是否应答 = 本实验待验证项） |
-| L3 存储路径 | DMA 读写 | 需 NAND，本期不做 |
+**实测答案：通信层完全可用。** 寄存器与邮箱命令都正常应答，能读出型号、
+序列号、固件版本、原配闪存型号和实时温度电压；而依赖闪存/FTL 初始化的
+运行时健康数据（读写量、坏块、寿命）不可用——固件停在初始化阶段。
+详见 [实测记录](RESULTS-2026-10-12.md)。
+
+## 组件
+
+| 文件 | 说明 |
+|------|------|
+| `pbregs.c` | 用户态探测工具（编译为 `pbregs`），经 sysfs `resource0` mmap 访问 BAR0 |
+| `pblaze_probe.c` | 内核探测模块，经 debugfs 暴露只读信息接口（无中断/无 DMA/无块设备） |
+| `PROTOCOL.md` | 寄存器映射、邮箱握手、XADC 序列、数据结构（本项目自研整理） |
+| `tests/regress_pbregs.py` | 离线回归测试：用模拟文件对验证参数解析与安全防护，无需硬件和 root |
+| `DIAGNOSIS.md` | 一次链路故障的完整诊断记录（含排查方法与教训） |
+| `RESULTS-*.md` | 各阶段实机实测记录 |
+| `NOTES-upstream-repo.md` | 对上游参考仓库的分析笔记 |
+
+## 能力分层
+
+| 层 | 内容 | 前置条件 |
+|----|------|---------|
+| **L1 寄存器** | FPGA 版本、位流编译日期、固件阶段 `ST_STAGE`、XADC 温度/电压、板卡温度、固件调试消息缓冲 | PCIe 链路有效、内存解码已使能、BAR 能应答 |
+| **L2 邮箱命令** | `CMD_READROM`(0x7) 身份键值、`CMD_READMON`(0x6) 健康计数 | 卡上固件应答 |
+| **L3 存储路径** | DMA 读写 | 需要闪存，本项目不实现 |
 
 ## 构建
 
 ```sh
-gcc -O2 -Wall -Wextra -std=gnu11 -o pbregs pbregs.c   # 用户态工具
-make                                                   # 内核模块
+# 用户态工具
+gcc -O2 -Wall -Wextra -std=gnu11 -o pbregs pbregs.c
+
+# 内核模块（需对应版本的内核头文件）
+make
 ```
 
-## 使用步骤（需 root）
+内核模块使用 `EXPORT_SYMBOL_GPL` 符号，因此声明为 GPL。
+
+## 使用
+
+设备通常没有内核驱动绑定，`Command` 寄存器的内存解码位默认为 0，
+**访问 BAR 前需先使能**：
 
 ```sh
-# 设备无驱动绑定，需先启用内存解码（内核不会自动做）
+# 把 0000:01:00.0 换成本机实际的 BDF（lspci -d 1c5f:）
 sudo setpci -s 0000:01:00.0 COMMAND=0002:0002
-
-# nvidia-smi 风格结构化汇总（中文，带边框表格）
-sudo ./pbregs status
-
-# 脚本友好：key=value 纯文本
-sudo ./pbregs -p status
-
-# 单项查询
-sudo ./pbregs peek 0     # 单次只读寄存器（预检失败即停止）
-sudo ./pbregs report     # 寄存器明细 + XADC（含通道选择写）
-sudo ./pbregs rom        # CMD_READROM 完整键值
-sudo ./pbregs mon        # CMD_READMON 原始健康块
-sudo ./pbregs msg        # 固件调试消息缓冲区
-
-# 离线回归测试（无需硬件/root）
-python3 tests/regress_pbregs.py
 ```
 
-`status` 输出分三张表：**设备信息**（型号/序列号/固件/总线/链路/容量/规格）、
-**传感器**（核心温度、各路电压、板温）、**健康指标**（坏块、坏 die、计数、
-容量、写放大、寿命）。固件未达 RUN 时健康项显示"不可用"并注明原因。
+然后用 `pbregs`（需 root，因为 `resource0` 权限为 `0600`）：
 
-`pbregs` 可用 `-t 毫秒` 调整邮箱超时（默认 200ms；官方驱动是 5 分钟死等）。
-原工具保留 `info`、`flowctl`、`dump` 实验命令。内核模块加载与主动
-flow-control 初始化等写操作须单独审核后再测。
+```sh
+sudo ./pbregs status      # nvidia-smi 风格结构化汇总（中文）
+sudo ./pbregs -p status   # key=value 纯文本，便于脚本
+sudo ./pbregs peek 0      # 单次只读寄存器
+sudo ./pbregs report      # 寄存器明细 + XADC
+sudo ./pbregs rom         # 完整 ROM 身份键值
+sudo ./pbregs mon         # 原始健康块
+sudo ./pbregs msg         # 固件调试消息缓冲区
+```
 
-## 判读标准
+设备路径默认 `/sys/bus/pci/devices/0000:01:00.0/resource0`，可用 `-d` 指定；
+邮箱超时用 `-t 毫秒` 调整（默认 200 ms）。
 
-- `status` 的 `FirmwareStage`：`INIT`=固件未就绪，`READY`=就绪待命，
-  `RUN`=完全运行。**无 NAND 时停在 INIT**，此时 `health` 组标注 `unavailable`。
-- `Status=Online` 仅当固件进入 RUN。`PCIeLink` 来自实时配置空间。
-- XADC 电压应接近 FPGA 标称值（VCCINT≈1.0V、VCCAUX≈1.8V、VDDR≈1.5V）；
-  数值明显偏离或全 0／全 1 说明读序列或链路有问题。
-- `rom`／`mon` 超时只表示该查询未完成，不能据此断言固件必须有 NAND 才能运行。
-- 配置空间或 MMIO 全一不是合法数据，工具会拒绝而非解码成正常状态。
+`status` 输出示例：
 
-## 实测结果（2026-10-12）
+```
++--------------------------------+--------------------------+----------------------+
+| Memblaze PBlaze3 状态监控                                    2026-10-12 17:55:40 |
+| 0000:01:00.0                                                        工具: pbregs |
++================================+==========================+======================+
+| 型号  PB3LM150T12              | 固件阶段  初始化 (INIT)  | 链路  x8 Gen2        |
+| 序列号  MH15227248             | 健康状态  离线           | 规格  半长半高       |
+| 固件版本  01.06.5101RTM        | 容量  不可用             |                      |
++--------------------------------+--------------------------+----------------------+
+```
 
-| 项目 | 结果 |
-|------|------|
-| FPGA 位流编译日期/时间 | 2015-10-17 05:32:39 |
-| Model / SN | PB3LM150T12 / MH15227248 |
+内核模块经 debugfs 暴露同类信息（`insmod pblaze_probe.ko` 后）。
+
+## 设计取舍
+
+- **诚实报告，不伪造数据。** 固件未进入运行阶段时，依赖 FTL 的健康字段
+  显示"不可用"并注明原因，而不是把零值当作"健康"。
+- **安全优先的访问。** `pbregs` 在 mmap 之前先读取实时 PCI 配置，校验设备 ID
+  与内存解码位；配置空间全 `0xff`（设备掉线）或解码未使能时直接拒绝访问，
+  **绝不把 `0xffffffff` 当作合法数据**解码成温度或状态。
+- **有界等待。** 邮箱轮询有单步超时；官方驱动是 5 分钟无界自旋。
+- **只读优先。** 查询类命令使用只读映射；`status`/`report` 因需写 XADC 通道
+  选择寄存器而使用可写映射，这是唯一的寄存器写操作。
+
+## 已知局限
+
+- 仅支持单卡，未实现多卡聚合（原驱动支持卡间 RAID0）。
+- 内核模块的 debugfs 根目录尚未创建，debugfs 路径暂不可用。
+- 邮箱命令缺少整条命令的总超时；多查询并发时共用邮箱尚无统一互斥。
+- 存储路径（L3）未实现；FTL 相关健康数据对无闪存的卡本身不可用。
+
+## 硬件实测摘要
+
+| 项目 | 值 |
+|------|-----|
+| 卡型号 / 序列号 | PB3LM150T12 / MH15227248 |
 | 固件版本 | 01.06.5101RTM (2015-10-19) |
-| Flash 型号 | Toshiba TH58TFT0DFKBA8J (MLC) |
-| PCIe 链路 | x8 Gen2 (5GT/s), DLActive+ |
-| 核心温度 / 板温 | 98.8°C / 58.2°C |
-| VCCINT / VCCAUX / VDDR | 1.01V / 1.80V / 1.49V |
-| 固件 stage | INIT（Offline） |
-| READROM | 成功（MB1） |
-| READMON | 完成但全零（固件未初始化） |
-| 健康/性能数据 | unavailable（依赖 FTL，无 NAND 不产生） |
+| FPGA 位流编译 | 2015-10-17 |
+| 原配闪存 | Toshiba TH58TFT0DFKBA8J (MLC) |
+| PCIe 链路 | x8 Gen2 (5 GT/s)，DLActive+ |
+| 核心温度 / 板温 | ~98 °C / ~58 °C |
+| VCCINT / VCCAUX / VDDR3 | 1.01 V / 1.80 V / 1.49 V |
+| 固件阶段 | INIT（无闪存，未进入运行） |
+
+## 许可
+
+[GPL-2.0-only](LICENSE)。内核模块因使用 GPL-only 符号必须为 GPL 兼容；
+协议实现亦参照了 GPL 授权的驱动。
+
+`PROTOCOL.md` 与全部源码为本项目自研，不含第三方代码。上游厂商驱动
+（`colyli/misc-tools`）**不随本仓库分发**——它没有 LICENSE 文件，
+仅在各源码文件中带有 `MODULE_LICENSE("GPL")` 声明；需要时请自行拉取并
+遵守其原始条款，不要重新授权。

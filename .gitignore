@@ -13,3 +13,6 @@ modules.order
 
 # Userspace tool
 pbregs
+
+# Vendor reference driver (fetched by scripts/fetch-vendor-driver.sh)
+vendor/

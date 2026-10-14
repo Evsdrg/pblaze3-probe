@@ -16,7 +16,7 @@
  *   /sys/kernel/debug/pblaze/<bdf>/monitor  health counters ("SMART")
  *
  * The register map, the mailbox handshake and the XADC read sequence
- * follow the 2016 vendor driver (see ref/); timeouts are bounded
+ * follow the 2016 vendor driver (see PROTOCOL.md); timeouts are bounded
  * instead of the original unbounded spins. Interrupts and DMA are not
  * used: every mailbox transaction is polled.
  */
