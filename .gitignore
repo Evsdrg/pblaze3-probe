@@ -1,8 +1,15 @@
+# Kernel module build artifacts
 *.o
 *.ko
 *.mod
 *.mod.c
 *.cmd
+.*.cmd
+..*.cmd
+.module-common.o
 Module.symvers
 modules.order
+*.order
+
+# Userspace tool
 pbregs
